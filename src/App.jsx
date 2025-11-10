@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { ArrowUp, MessageSquare, Plus, Filter, Clock } from 'lucide-react'
+import { ArrowUp, MessageSquare, Plus, Rocket } from 'lucide-react'
 
 const API_BASE = import.meta.env.VITE_BACKEND_URL || ''
 
@@ -11,11 +11,15 @@ function Badge({ children }) {
   )
 }
 
-function IdeaCard({ idea, onUpvote, onOpen }) {
+function IdeaCard({ idea, onUpvote, onOpen, hasVoted }) {
   return (
     <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-5 hover:border-slate-700 transition">
       <div className="flex items-start gap-4">
-        <button onClick={() => onUpvote(idea)} className="flex flex-col items-center rounded-lg bg-slate-800/80 border border-slate-700 px-3 py-2 hover:bg-slate-800">
+        <button
+          onClick={() => !hasVoted && onUpvote(idea)}
+          className={`flex flex-col items-center rounded-lg bg-slate-800/80 border border-slate-700 px-3 py-2 ${hasVoted ? 'opacity-50 cursor-not-allowed' : 'hover:bg-slate-800'}`}
+          title={hasVoted ? 'You already voted' : 'Upvote'}
+        >
           <ArrowUp className="w-4 h-4" />
           <span className="text-sm mt-1 font-semibold">{idea.votes || 0}</span>
         </button>
@@ -33,7 +37,7 @@ function IdeaCard({ idea, onUpvote, onOpen }) {
               <MessageSquare className="w-4 h-4" /> {idea.comments || 0} comments
             </button>
             {idea.author && <span>by <span className="text-slate-200">{idea.author}</span></span>}
-            {idea.link && <a className="text-sky-300 hover:underline" href={idea.link} target="_blank" rel="noreferrer">link</a>}
+            {idea.link && <a className="text-sky-300 hover:underline" href={idea.link} target="_blank" rel="noreferrer">Visit link</a>}
           </div>
         </div>
       </div>
@@ -93,6 +97,27 @@ export default function App() {
   const [sort, setSort] = useState('votes')
   const [modalOpen, setModalOpen] = useState(false)
   const [active, setActive] = useState(null)
+  const [toast, setToast] = useState('')
+
+  // Persisted voter ID + voted idea ids
+  const [voterId, setVoterId] = useState('')
+  const [voted, setVoted] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('vibe_voted') || '{}') } catch { return {} }
+  })
+
+  useEffect(() => {
+    let id = localStorage.getItem('vibe_voter_id')
+    if (!id) {
+      id = crypto && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)
+      localStorage.setItem('vibe_voter_id', id)
+    }
+    setVoterId(id)
+  }, [])
+
+  const showToast = (msg) => {
+    setToast(msg)
+    setTimeout(() => setToast(''), 2000)
+  }
 
   const fetchIdeas = async () => {
     try {
@@ -104,6 +129,8 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/ideas?${params.toString()}`)
       const data = await res.json()
       setIdeas(data)
+      // if a detail is open, keep its vote count in sync
+      setActive(a => a ? { ...a, votes: (data.find(d => d.id === a.id)?.votes || a.votes) } : a)
     } catch (e) {
       setError('Failed to load ideas')
     } finally {
@@ -114,28 +141,63 @@ export default function App() {
   useEffect(() => { fetchIdeas() }, [period, sort])
 
   const upvote = async (idea) => {
-    await fetch(`${API_BASE}/api/votes`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ idea_id: idea.id })
-    })
-    fetchIdeas()
+    if (voted[idea.id]) {
+      showToast('You already voted')
+      return
+    }
+    // Optimistic UI update
+    setIdeas(prev => prev.map(i => i.id === idea.id ? { ...i, votes: (i.votes || 0) + 1 } : i))
+    setActive(a => a && a.id === idea.id ? { ...a, votes: (a.votes || 0) + 1 } : a)
+    try {
+      const res = await fetch(`${API_BASE}/api/votes`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idea_id: idea.id, voter: voterId })
+      })
+      if (res.status === 409) {
+        showToast('You already voted')
+        // revert optimistic update
+        setIdeas(prev => prev.map(i => i.id === idea.id ? { ...i, votes: Math.max((i.votes || 1) - 1, 0) } : i))
+        setActive(a => a && a.id === idea.id ? { ...a, votes: Math.max((a.votes || 1) - 1, 0) } : a)
+        return
+      }
+      if (!res.ok) throw new Error('Vote failed')
+      // mark as voted locally
+      const newVoted = { ...voted, [idea.id]: true }
+      setVoted(newVoted)
+      localStorage.setItem('vibe_voted', JSON.stringify(newVoted))
+      showToast('Upvoted!')
+    } catch (e) {
+      // revert optimistic update on error
+      setIdeas(prev => prev.map(i => i.id === idea.id ? { ...i, votes: Math.max((i.votes || 1) - 1, 0) } : i))
+      setActive(a => a && a.id === idea.id ? { ...a, votes: Math.max((a.votes || 1) - 1, 0) } : a)
+      showToast('Something went wrong')
+    }
   }
 
   const createIdea = async (payload) => {
-    await fetch(`${API_BASE}/api/ideas`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    })
-    setModalOpen(false)
-    fetchIdeas()
+    try {
+      const res = await fetch(`${API_BASE}/api/ideas`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      const data = await res.json()
+      // immediately add to list
+      setIdeas(prev => [data, ...prev])
+      setModalOpen(false)
+      showToast('Idea posted!')
+    } catch (e) {
+      showToast('Could not post idea')
+    }
   }
 
   const addComment = async (ideaId, content, author) => {
-    await fetch(`${API_BASE}/api/comments`, {
+    const res = await fetch(`${API_BASE}/api/comments`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ idea_id: ideaId, content, author })
     })
-    fetchIdeas()
+    if (!res.ok) throw new Error('Comment failed')
+    const data = await res.json()
+    return data
   }
 
   return (
@@ -143,7 +205,10 @@ export default function App() {
       <header className="border-b border-slate-800/60 sticky top-0 z-10 backdrop-blur-sm bg-slate-950/70">
         <div className="container px-4 py-4 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <span className="text-lg font-bold">Vibe Hunt</span>
+            <div className="inline-flex items-center gap-2">
+              <Rocket className="w-5 h-5 text-sky-400" />
+              <span className="text-lg font-bold bg-gradient-to-r from-sky-400 via-fuchsia-400 to-emerald-400 bg-clip-text text-transparent">Vibe Hunt</span>
+            </div>
             <span className="text-slate-400 hidden sm:inline">Discover and upvote the best app ideas</span>
           </div>
           <button onClick={() => setModalOpen(true)} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white">
@@ -177,7 +242,7 @@ export default function App() {
 
         <div className="grid gap-4">
           {ideas.map(idea => (
-            <IdeaCard key={idea.id} idea={idea} onUpvote={upvote} onOpen={setActive} />
+            <IdeaCard key={idea.id} idea={idea} onUpvote={upvote} onOpen={setActive} hasVoted={!!voted[idea.id]} />
           ))}
         </div>
       </main>
@@ -197,7 +262,7 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-4 mt-4">
-              <button onClick={()=>upvote(active)} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700">
+              <button onClick={()=>upvote(active)} className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 ${voted[active.id] ? 'opacity-50 cursor-not-allowed' : 'hover:bg-slate-700'}`} disabled={!!voted[active.id]}>
                 <ArrowUp className="w-4 h-4"/> Upvote ({active.votes || 0})
               </button>
               {active.link && <a className="text-sky-300 hover:underline" href={active.link} target="_blank" rel="noreferrer">Visit link</a>}
@@ -206,6 +271,10 @@ export default function App() {
             <Comments ideaId={active.id} onAdd={addComment} />
           </div>
         </div>
+      )}
+
+      {toast && (
+        <div className="fixed bottom-4 right-4 px-3 py-2 rounded-lg bg-slate-800/90 border border-slate-700 text-sm">{toast}</div>
       )}
     </div>
   )
@@ -226,9 +295,13 @@ function Comments({ ideaId, onAdd }) {
   const submit = async (e) => {
     e.preventDefault()
     if (!content.trim()) return
-    await onAdd(ideaId, content, author)
-    setContent(''); setAuthor('')
-    load()
+    try {
+      const doc = await onAdd(ideaId, content, author)
+      setList(prev => [doc, ...prev])
+      setContent(''); setAuthor('')
+    } catch {
+      // no-op; keep content so user can retry
+    }
   }
 
   return (
